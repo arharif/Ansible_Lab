@@ -1,0 +1,515 @@
+---
+# Cisco Catalyst 9300 / IOS XE 17.5.6 / Ansible Automation Platform 2.5
+# ONE YAML: exact show-vlan parser, conservative 802.1X/MAB, FINAL FLEET REPORT.
+# DEFAULT = READ-ONLY DISCOVERY. No switch modifications in this mode.
+# NOTE: Ansible rescue CANNOT guarantee rollback after SSH/management loss.
+# Production auto-recovery across connectivity loss requires a separately tested
+# device-side failsafe or out-of-band recovery procedure.
+
+- name: C9300 | Discover user Data VLAN, optionally deploy 802.1X/MAB
+  hosts: all:!localhost
+  gather_facts: false
+  serial: 1
+  connection: ansible.netcommon.network_cli
+  become: true
+  become_method: enable
+
+  vars:
+    ansible_network_os: cisco.ios.ios
+    ansible_command_timeout: 90
+    operation: discover                    # discover | deploy
+    vlan_policy: five_hundreds            # five_hundreds | exact_name
+    vlan_name: Vlan_Data                  # applies to exact_name only
+    allow_voice_vlan_ports: false
+    allow_high_speed_ports: false         # excludes Te/Tw/Fo/Hu ports by default
+    deployment_approved: false
+    deployment_scope: approved_only       # approved_only | all_eligible
+    bulk_deployment_approved: false
+    aaa_ready_confirmed: false
+    rollback_tested_confirmed: false
+    max_ports_per_switch: 1
+    overwrite_description: false
+    disable_link_status_logging: false
+    disable_link_status_traps: false
+    disable_auto_mdix: false
+    enable_disabled_ports: false
+    require_authorized_session: false
+    authentication_settle_seconds: 12
+    tftp_server: ""                       # optional, approved internal destination
+
+    # Stack physical interfaces. No port-channel/VLAN/Ap interfaces included.
+    physical_port_re: >-
+      (?<![A-Za-z0-9/])(?:GigabitEthernet|TenGigabitEthernet|TwentyFiveGigE|FortyGigabitEthernet|HundredGigE|Gi|Te|Twe|Tw|Fo|Hu|Fa)[0-9]+/[0-9]+/[0-9]+\b
+    port_only_re: >-
+      (?i)^(?:Gi|GigabitEthernet|Fa|FastEthernet)[0-9]+/[0-9]+/[0-9]+$
+
+    dot1x_mab_commands:
+      - switchport mode access
+      - switchport nonegotiate
+      - authentication control-direction in
+      - authentication event fail action next-method
+      - authentication host-mode multi-auth
+      - authentication order dot1x mab
+      - authentication priority dot1x mab
+      - authentication port-control auto
+      - authentication periodic
+      - authentication timer reauthenticate server
+      - authentication timer inactivity 30
+      - mab
+      - dot1x pae authenticator
+      - dot1x timeout tx-period 8
+      - dot1x max-reauth-req 3
+      - dot1x max-start 5
+
+  tasks:
+    - name: 00 | Initialize reporting state and operator-supplied lists
+      ansible.builtin.set_fact:
+        dot1x_stage: "STARTED"
+        report_operation: "{{ operation }}"
+        report_vlan_policy: "{{ vlan_policy }}"
+        final_outcome: "NOT COMPLETED"
+        checkpoint_path: "NOT CREATED"
+        config_save_status: "NOT SAVED"
+        rollback_status: "NOT REQUIRED"
+        tftp_status: "NOT REQUESTED"
+        target_interfaces: []
+        changed_interfaces: []
+        candidate_interfaces: []
+        eligible_interfaces: []
+        rejected_records: []
+        conflicting_interfaces: []
+        selected_vlan_records: []
+        vlan_port_map: []
+        approved_list: "{{ approved_interfaces | default([]) }}"
+        excluded_list: "{{ excluded_interfaces | default([]) }}"
+
+    - name: 00a | Validate policy and scope input before contacting switches
+      ansible.builtin.assert:
+        that:
+          - operation in ['discover', 'deploy']
+          - vlan_policy in ['five_hundreds', 'exact_name']
+          - vlan_name | length > 0
+          - approved_list is sequence and approved_list is not string
+          - excluded_list is sequence and excluded_list is not string
+        fail_msg: "Invalid operation or input list; no configuration was changed."
+
+    - name: 01 | Retrieve the exact Cisco show vlan table once
+      cisco.ios.ios_command:
+        commands:
+          - show vlan
+      register: cli_vlan
+      changed_when: false
+
+    - name: 02 | Normalize control characters, preserve line breaks
+      ansible.builtin.set_fact:
+        vlan_text: "{{ (cli_vlan.stdout[0] | default('')) | regex_replace('\\r', '') }}"
+
+    - name: 03 | Parse only physical-port tokens belonging to their VLAN row
+      ansible.builtin.set_fact:
+        parsed_vlan_records: >-
+          {%- set ns = namespace(rows=[], current=-1, warnings=[]) -%}
+          {%- for line in vlan_text.splitlines() -%}
+            {%- set match_row = line | regex_findall('(?i)^[ \t]*([0-9]{1,4})[ \t]+([^ \t\r\n]+)[ \t]+(active|act/unsup|suspend|shutdown)(?:[ \t]+(.*))?[ \t]*$') -%}
+            {%- if match_row | length > 0 -%}
+              {%- set row = match_row[0] -%}
+              {%- set tail = row[3] | default('') | trim -%}
+              {%- set ports = tail | regex_findall(physical_port_re) | unique | list -%}
+              {%- set remainder = tail | regex_replace(physical_port_re, '') | regex_replace('[ \t,]', '') -%}
+              {%- if remainder | length > 0 -%}
+                {%- set ns.warnings = ns.warnings + ['Unparsed tokens in VLAN ' ~ row[0] ~ ': ' ~ remainder] -%}
+              {%- endif -%}
+              {%- set ns.rows = ns.rows + [{'id': (row[0] | int), 'name': row[1], 'status': (row[2] | lower), 'ports': ports}] -%}
+              {%- set ns.current = (ns.rows | length) - 1 -%}
+            {%- elif ns.current >= 0 and (line | regex_search('^[ \t]+(?:Gi|Te|Tw|Twe|Fo|Hu|Fa|GigabitEthernet|TenGigabitEthernet|TwentyFiveGigE|FortyGigabitEthernet|HundredGigE)[0-9]+/[0-9]+/[0-9]+')) -%}
+              {%- set ports = line | regex_findall(physical_port_re) | unique | list -%}
+              {%- set remainder = line | regex_replace(physical_port_re, '') | regex_replace('[ \t,]', '') -%}
+              {%- if remainder | length > 0 -%}
+                {%- set ns.warnings = ns.warnings + ['Unparsed continuation VLAN ' ~ (ns.rows[ns.current].id | string) ~ ': ' ~ remainder] -%}
+              {%- else -%}
+                {%- set r = ns.rows[ns.current] -%}
+                {%- set updated = {'id': r.id, 'name': r.name, 'status': r.status, 'ports': (r.ports + ports | unique | list)} -%}
+                {%- set ns.rows = ns.rows[:ns.current] + [updated] + ns.rows[ns.current + 1:] -%}
+              {%- endif -%}
+            {%- elif line | regex_search('(?i)^[ \t]*(?:VLAN[ \t]+Name\b|----|$)') -%}
+              {# repeated paging header; maintain the previous VLAN for valid continuation #}
+            {%- else -%}
+              {%- set ns.current = -1 -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ {'rows': ns.rows, 'warnings': ns.warnings} }}
+
+    - name: 04 | Confirm VLAN parsing is trustworthy
+      ansible.builtin.assert:
+        that:
+          - (parsed_vlan_records.rows | length) > 0
+          - (parsed_vlan_records.rows | selectattr('status', 'equalto', 'active') | list | length) > 0
+          - not (vlan_text is search('(?im)^\s*% ?(?:invalid|error|ambiguous|authorization)'))
+        fail_msg: >-
+          Cannot parse 'show vlan' safely. First lines:
+          {{ vlan_text.splitlines()[:35] }}. No changes made.
+
+    - name: 05 | Select active Data VLANs by operator policy
+      ansible.builtin.set_fact:
+        active_vlan_records: "{{ parsed_vlan_records.rows | selectattr('status', 'equalto', 'active') | list }}"
+        selected_vlan_records: >-
+          {{
+            (parsed_vlan_records.rows | selectattr('status','equalto','active')
+             | selectattr('id', 'ge', 500) | selectattr('id', 'le', 599) | list)
+            if vlan_policy == 'five_hundreds' else
+            (parsed_vlan_records.rows | selectattr('status', 'equalto', 'active')
+             | selectattr('name', 'match', '(?i)^' ~ (vlan_name | regex_escape) ~ '$') | list)
+          }}
+
+    - name: 06 | Stop when selected VLAN does not exist
+      ansible.builtin.assert:
+        that:
+          - selected_vlan_records | length > 0
+        fail_msg: >-
+          No active VLAN matches {{ vlan_policy }} / {{ vlan_name }}.
+          Available: {{ active_vlan_records | map(attribute='id') | list }}.
+          No changes made.
+
+    - name: 07 | Construct accurate VLAN membership without show vlan id
+      ansible.builtin.set_fact:
+        vlan_port_map: >-
+          {%- set ns = namespace(mapping=[]) -%}
+          {%- for r in selected_vlan_records -%}
+            {%- set ns.mapping = ns.mapping + [{'vlan_id': r.id, 'vlan_name': r.name, 'ports': r.ports}] -%}
+          {%- endfor -%}
+          {{ ns.mapping }}
+        candidate_interfaces: >-
+          {{ selected_vlan_records | map(attribute='ports') | flatten | unique | sort | list }}
+        selected_vlan_ids: "{{ selected_vlan_records | map(attribute='id') | map('string') | list }}"
+
+    - name: 08 | Detect only REAL cross-VLAN duplicates by exact membership
+      ansible.builtin.set_fact:
+        conflicting_interfaces: >-
+          {%- set ns = namespace(duplicates=[], memberships=[]) -%}
+          {%- for port in candidate_interfaces -%}
+            {%- set ns.memberships = [] -%}
+            {%- for vlan in active_vlan_records -%}
+              {%- if port in vlan.ports -%}
+                {%- set ns.memberships = ns.memberships + [vlan.id] -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- if (ns.memberships | unique | list | length) > 1 -%}
+              {%- set ns.duplicates = ns.duplicates + [port] -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ ns.duplicates }}
+
+    - name: 09 | Inspect real switchport mode, access VLAN and voice VLAN
+      cisco.ios.ios_command:
+        commands:
+          - "show interfaces {{ item }} switchport"
+      loop: "{{ candidate_interfaces }}"
+      loop_control:
+        label: "{{ item }}"
+      register: switchport_inspections
+      changed_when: false
+
+    - name: 10 | Build an auditable decision and reason for every candidate
+      ansible.builtin.set_fact:
+        port_decisions: "{{ (port_decisions | default([])) + [{'interface': item.item, 'actual_vlan': actual_access_vlan, 'voice_vlan': actual_voice_vlan, 'decision': decision}] }}"
+      vars:
+        port_output: "{{ item.stdout[0] | default('') }}"
+        actual_access_vlan: "{{ port_output | regex_findall('(?im)^Access Mode VLAN:[ \t]*([0-9]{1,4})\\b') | first | default('unknown') }}"
+        actual_voice_vlan: "{{ port_output | regex_findall('(?im)^Voice VLAN:[ \t]*([^ \t\r\n]+)') | first | default('unknown') }}"
+        is_switchport: "{{ port_output is search('(?im)^Switchport:[ \t]*Enabled[ \t]*$') }}"
+        is_static_access: "{{ port_output is search('(?im)^Administrative Mode:[ \t]*static access[ \t]*$') }}"
+        decision: >-
+          {% if item.item in conflicting_interfaces %}REJECT: CONFLICTING_VLAN_MEMBERSHIP
+          {% elif item.item in excluded_list %}REJECT: EXPLICIT_EXCLUSION
+          {% elif not (allow_high_speed_ports | bool) and not (item.item is match(port_only_re)) %}REJECT: HIGH_SPEED_OR_UNAPPROVED_PORT_TYPE
+          {% elif not (is_switchport | bool) %}REJECT: NOT_A_SWITCHPORT_OR_UNREADABLE
+          {% elif not (is_static_access | bool) %}REJECT: NOT_STATIC_ACCESS
+          {% elif actual_access_vlan not in selected_vlan_ids %}REJECT: ACCESS_VLAN_MISMATCH
+          {% elif not (allow_voice_vlan_ports | bool) and (actual_voice_vlan | lower) not in ['none', '0'] %}REJECT: VOICE_VLAN_PRESENT_OR_UNKNOWN
+          {% else %}ELIGIBLE{% endif %}
+      loop: "{{ switchport_inspections.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: 11 | Split allowed and rejected interface records
+      ansible.builtin.set_fact:
+        eligible_interfaces: "{{ port_decisions | default([]) | selectattr('decision', 'equalto', 'ELIGIBLE') | map(attribute='interface') | list }}"
+        rejected_records: "{{ port_decisions | default([]) | rejectattr('decision', 'equalto', 'ELIGIBLE') | list }}"
+        dot1x_stage: "DISCOVERY COMPLETE"
+
+    - name: 12 | Refuse ambiguous CLI parsing during a deployment
+      ansible.builtin.assert:
+        that:
+          - parsed_vlan_records.warnings | length == 0
+        fail_msg: >-
+          Unrecognized VLAN table fields prevent safe deployment:
+          {{ parsed_vlan_records.warnings }}. Discovery can still be reviewed.
+      when: operation == 'deploy'
+
+    - name: 13 | Determine selected deployment interfaces
+      ansible.builtin.set_fact:
+        target_interfaces: >-
+          {{ (approved_list if deployment_scope == 'approved_only' else eligible_interfaces)
+             | unique | sort | list }}
+      when: operation == 'deploy'
+
+    - name: 14 | Gate all changes behind verification and change approval
+      ansible.builtin.assert:
+        that:
+          - deployment_approved | bool
+          - aaa_ready_confirmed | bool
+          - rollback_tested_confirmed | bool
+          - deployment_scope in ['approved_only', 'all_eligible']
+          - deployment_scope != 'all_eligible' or (bulk_deployment_approved | bool)
+          - target_interfaces | length > 0
+          - target_interfaces | difference(eligible_interfaces) | length == 0
+          - target_interfaces | length <= (max_ports_per_switch | int)
+          - (max_ports_per_switch | int) > 0
+        fail_msg: >-
+          DEPLOYMENT BLOCKED. Need explicit approvals, a tested rollback method,
+          AAA readiness, a valid interface scope and max_ports_per_switch.
+      when: operation == 'deploy'
+
+    - name: 15 | Mark successful discovery-only workflow
+      ansible.builtin.set_fact:
+        final_outcome: "DISCOVERY ONLY - NO CONFIGURATION CHANGE"
+      when: operation == 'discover'
+
+    - name: 16 | Create unique device checkpoint path
+      ansible.builtin.set_fact:
+        backup_filename: "dot1x_pre_{{ now(utc=true, fmt='%Y%m%dT%H%M%SZ') }}_{{ tower_job_id | default('manual') }}.cfg"
+      when: operation == 'deploy'
+
+    - name: 17 | Checkpoint original running configuration before any changes
+      cisco.ios.ios_command:
+        commands:
+          - command: "copy running-config flash:{{ backup_filename }}"
+            prompt: '(?i)Destination filename.*\\?|\\[confirm\\]'
+            answer: "\r"
+      register: checkpoint_copy
+      changed_when: true
+      when: operation == 'deploy'
+
+    - name: 18 | Verify backup checkpoint exists
+      cisco.ios.ios_command:
+        commands:
+          - "dir flash:{{ backup_filename }}"
+      register: checkpoint_check
+      changed_when: false
+      when: operation == 'deploy'
+
+    - name: 19 | Stop if there is no verified prechange backup
+      ansible.builtin.assert:
+        that:
+          - backup_filename in checkpoint_check.stdout[0]
+          - checkpoint_check.stdout[0] is not search('(?i)(file not found|error opening|no such file|% ?error)')
+        fail_msg: "Configuration backup not confirmed on switch flash. NO ports modified."
+      when: operation == 'deploy'
+
+    - name: 20 | Mark stored checkpoint
+      ansible.builtin.set_fact:
+        checkpoint_path: "flash:{{ backup_filename }}"
+        dot1x_stage: "CHECKPOINT READY"
+      when: operation == 'deploy'
+
+    - name: 21 | Configure, validate, save or attempt rollback
+      when: operation == 'deploy'
+      block:
+        - name: 21a | Apply authentication configuration only to approved ports
+          cisco.ios.ios_config:
+            parents: "interface {{ item.interface }}"
+            lines: >-
+              {{
+                (['description Data'] if overwrite_description | bool else [])
+                + ['switchport access vlan ' ~ item.actual_vlan]
+                + dot1x_mab_commands
+                + (['no logging event link-status'] if disable_link_status_logging | bool else [])
+                + (['no snmp trap link-status'] if disable_link_status_traps | bool else [])
+                + (['no mdix auto'] if disable_auto_mdix | bool else [])
+                + (['no shutdown'] if enable_disabled_ports | bool else [])
+              }}
+            match: line
+            save_when: never
+          loop: "{{ port_decisions | selectattr('interface','in',target_interfaces) | list }}"
+          loop_control:
+            label: "{{ item.interface }}"
+          register: config_changes
+
+        - name: 21b | Identify which interfaces were actually changed
+          ansible.builtin.set_fact:
+            changed_interfaces: >-
+              {{ config_changes.results | selectattr('changed', 'equalto', true)
+                 | map(attribute='item.interface') | list }}
+            dot1x_stage: "CONFIGURATION APPLIED"
+
+        - name: 21c | Retrieve postchange running config from approved ports
+          cisco.ios.ios_command:
+            commands:
+              - "show running-config interface {{ item }}"
+          loop: "{{ target_interfaces }}"
+          loop_control:
+            label: "{{ item }}"
+          register: post_config
+          changed_when: false
+
+        - name: 21d | Assert the essential 802.1X/MAB commands exist
+          ansible.builtin.assert:
+            that:
+              - item.stdout[0] is search('(?m)^[ \t]*authentication port-control auto[ \t]*$')
+              - item.stdout[0] is search('(?m)^[ \t]*authentication order dot1x mab[ \t]*$')
+              - item.stdout[0] is search('(?m)^[ \t]*authentication host-mode multi-auth[ \t]*$')
+              - item.stdout[0] is search('(?m)^[ \t]*mab[ \t]*$')
+              - item.stdout[0] is search('(?m)^[ \t]*dot1x pae authenticator[ \t]*$')
+              - >-
+                (dot1x_mab_commands | difference(
+                 item.stdout[0].splitlines() | map('trim') | list) | length) == 0
+              - >-
+                (item.stdout[0] | regex_findall(
+                 '(?m)^[ \t]*switchport access vlan[ \t]*([0-9]{1,4})\\b')
+                 | first | default('')) in selected_vlan_ids
+            fail_msg: "The expected config is missing on {{ item.item }}"
+          loop: "{{ post_config.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        - name: 21e | Give connected clients a chance to authenticate when requested
+          ansible.builtin.pause:
+            seconds: "{{ authentication_settle_seconds | int }}"
+          when: require_authorized_session | bool
+
+        - name: 21f | Read postdeployment authentication state when requested
+          cisco.ios.ios_command:
+            commands:
+              - "show authentication sessions interface {{ item }} details"
+          loop: "{{ target_interfaces }}"
+          loop_control:
+            label: "{{ item }}"
+          register: client_sessions
+          changed_when: false
+          when: require_authorized_session | bool
+
+        - name: 21g | Require an authorized session when requested
+          ansible.builtin.assert:
+            that:
+              - item.stdout[0] is search('(?im)^\s*Status:[ \t]*Authorized\b')
+            fail_msg: "No authorized 802.1X/MAB session reported on {{ item.item }}"
+          loop: "{{ client_sessions.results | default([]) }}"
+          loop_control:
+            label: "{{ item.item }}"
+          when: require_authorized_session | bool
+
+        - name: 21h | Save configuration after successful validation
+          cisco.ios.ios_config:
+            save_when: modified
+          register: save_result
+          when: changed_interfaces | length > 0
+
+        - name: 21i | Record the commit result without overstating client health
+          ansible.builtin.set_fact:
+            config_save_status: "SAVED IF MODIFIED" 
+            dot1x_stage: "CONFIGURATION CHECKED"
+            final_outcome: "CONFIGURATION VERIFIED; ENDPOINT HEALTH REQUIRES CHECK"
+
+      rescue:
+        - name: 21r | Flag rollback attempt before issuing a recovery command
+          ansible.builtin.set_fact:
+            dot1x_stage: "CONFIGURATION FAILED"
+            final_outcome: "FAILED - RECOVERY NEEDS VERIFICATION"
+            rollback_status: "ATTEMPTED - NOT YET VERIFIED"
+
+        - name: 21s | Try to restore the pre-change device checkpoint
+          cisco.ios.ios_command:
+            commands:
+              - "configure replace flash:{{ backup_filename }} force"
+          register: rollback_result
+          ignore_errors: true
+
+        - name: 21t | Record recovery outcome conservatively
+          ansible.builtin.set_fact:
+            rollback_status: >-
+              {{ 'COMMAND RETURNED - VERIFY DEVICE CONFIG'
+                 if rollback_result is defined and not (rollback_result.failed | default(true))
+                 else 'FAILED OR CONNECTION UNAVAILABLE - INVESTIGATE IMMEDIATELY' }}
+
+        - name: 21u | Keep the AAP job FAILED after recovery attempt
+          ansible.builtin.fail:
+            msg: >-
+              Configuration/validation failed. Recovery was attempted from
+              flash:{{ backup_filename }} but must be verified on the switch.
+              Device-side recovery for SSH loss is not implemented here.
+
+    - name: 22 | Optional TFTP export of successfully checked configuration
+      cisco.ios.ios_command:
+        commands:
+          - command: >-
+              copy running-config tftp://{{ tftp_server }}/{{ inventory_hostname }}-dot1x-{{ tower_job_id | default('manual') }}.cfg
+            prompt: '(?i)Destination filename.*\\?|\\[confirm\\]'
+            answer: "\r"
+      register: tftp_export
+      when:
+        - operation == 'deploy'
+        - (tftp_server | length) > 0
+
+    - name: 23 | State whether optional final TFTP export was requested
+      ansible.builtin.set_fact:
+        tftp_status: >-
+          {{ 'ATTEMPTED - VERIFY DESTINATION FILE' if tftp_server | length > 0
+             else 'NOT REQUESTED' }}
+      when: operation == 'deploy'
+
+# A SECOND PLAY targeting the same switch host-pattern, WITHOUT serial=1,
+# allows one run_once summary. Delegation to localhost also works when AAP
+# limits the job to one named switch (a separate localhost play would be skipped).
+- name: Final | One consolidated AAP device/port/result report
+  hosts: all:!localhost
+  gather_facts: false
+  tasks:
+    - name: 99 | FINAL REPORT - selected switches and all interfaces
+      ansible.builtin.debug:
+        msg: |-
+          ======================================================================
+                         CISCO C9300 802.1X / MAB - FINAL JOB REPORT
+          ======================================================================
+          {% set devices = ansible_play_hosts_all | sort %}
+          DEVICES IN INVENTORY: {{ devices | length }}
+          {% for hostname in devices %}
+          {% set h = hostvars[hostname] %}
+          ----------------------------------------------------------------------
+          DEVICE: {{ hostname }}
+          OPERATION: {{ h.report_operation | default('UNKNOWN') }}
+          STAGE: {{ h.dot1x_stage | default('NOT REACHED') }}
+          RESULT: {{ h.final_outcome | default('UNKNOWN / UNREACHABLE') }}
+          POLICY: {{ h.report_vlan_policy | default('UNKNOWN') }}
+          ACTIVE VLAN COUNT: {{ h.active_vlan_records | default([]) | length }}
+          ACTIVE VLAN INVENTORY: {% for v in h.active_vlan_records | default([]) %}{{ v.id }}={{ v.name }}{% if not loop.last %}; {% endif %}{% else %}Unavailable{% endfor %}
+          TARGET VLANS:
+          {% for vlan in h.selected_vlan_records | default([]) %}
+            VLAN {{ vlan.id }} | {{ vlan.name }} | {{ vlan.ports | length }} raw listed ports
+            Raw member ports: {{ vlan.ports | join(', ') if vlan.ports | length > 0 else 'No listed ports' }}
+          {% else %}
+            None selected / discovery incomplete
+          {% endfor %}
+          COUNTS: candidate={{ h.candidate_interfaces | default([]) | length }} | eligible={{ h.eligible_interfaces | default([]) | length }} | rejected={{ h.rejected_records | default([]) | length }} | conflicting={{ h.conflicting_interfaces | default([]) | length }}
+          ALL CANDIDATE PORTS: {{ h.candidate_interfaces | default([]) | join(', ') if h.candidate_interfaces | default([]) | length > 0 else 'None' }}
+          DISCOVERED ELIGIBLE PORTS: {{ h.eligible_interfaces | default([]) | join(', ') if h.eligible_interfaces | default([]) | length > 0 else 'None' }}
+          REJECTED PORTS AND REASONS:
+          {% for p in h.rejected_records | default([]) %}
+            {{ p.interface }} | {{ p.decision }} | actual_VLAN={{ p.actual_vlan }} | voice={{ p.voice_vlan }}
+          {% else %}
+            None
+          {% endfor %}
+          TRUE CROSS-VLAN CONFLICTS: {{ h.conflicting_interfaces | default([]) | join(', ') if h.conflicting_interfaces | default([]) | length > 0 else 'None' }}
+          VLAN PARSER WARNINGS: {{ h.parsed_vlan_records.warnings | default([]) | join(' ; ') if h.parsed_vlan_records is defined else 'No parser result' }}
+          DEPLOYMENT TARGETS: {{ h.target_interfaces | default([]) | join(', ') if h.target_interfaces | default([]) | length > 0 else 'None' }}
+          ACTUALLY CHANGED: {{ h.changed_interfaces | default([]) | join(', ') if h.changed_interfaces | default([]) | length > 0 else 'None recorded' }}
+          PRE-CHANGE CHECKPOINT: {{ h.checkpoint_path | default('Unknown') }}
+          RUNNING->STARTUP: {{ h.config_save_status | default('UNKNOWN') }}
+          ROLLBACK: {{ h.rollback_status | default('UNKNOWN') }}
+          TFTP EXPORT: {{ h.tftp_status | default('UNKNOWN') }}
+          {% endfor %}
+          ======================================================================
+          SAFETY: 'ELIGIBLE' means switchport checks passed; it does not mean
+          the endpoint was authenticated or approved for a change. SSH-only
+          rescue is NOT an autonomous recovery mechanism for lost management.
+          ======================================================================
+      run_once: true
+      delegate_to: localhost
