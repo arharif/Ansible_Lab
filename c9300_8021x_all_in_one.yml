@@ -1,0 +1,416 @@
+---
+# CISCO CATALYST 9300 / IOS XE 17.5.6 / ANSIBLE AUTOMATION PLATFORM 2.5
+# ONE FILE — No Vlan_Data variable or per-switch VLAN mapping required.
+# Automatically finds ACTIVE VLANs 500-599, then verifies actual access VLAN
+# and access mode for every candidate before selecting an interface.
+#
+# SAFE FIRST RUN: run_mode=discover (READ ONLY, no backup or config changes).
+# Deployment requires explicit approval. Scope is approved_only by default.
+# Point the AAP Job Template/Limit at ONLY authorized Cisco C9300 stacks.
+# Use AAP Network credentials for SSH/enable: NO passwords in this YAML.
+# Requires cisco.ios and ansible.netcommon in the Execution Environment.
+#
+# Recovery: on detected errors, attempt 'configure replace' from flash over SSH.
+# NOT a guaranteed recovery if management SSH goes down. Test out-of-band
+# access and a device-side fail-safe separately before production deployment.
+#
+- name: Auto-discover Data VLAN 5xx access ports and optionally deploy dot1x MAB
+  hosts: all
+  gather_facts: false
+  connection: ansible.netcommon.network_cli
+  become: true
+  become_method: enable
+  serial: 1
+
+  vars:
+    ansible_network_os: cisco.ios.ios
+    ansible_command_timeout: 180
+
+    # AAP extra vars may override all controls below.
+    run_mode: discover                  # discover | deploy
+    deployment_approved: false         # MUST be true to modify configuration
+    deploy_scope: approved_only        # approved_only | all_discovered
+    approved_interfaces: []            # e.g. ['Gi1/0/10'] from discovery report
+    excluded_interfaces: []            # exact names as in discovery output
+    max_ports_per_run: 1               # deliberate change-size limit per stack
+    allow_voice_vlan_ports: false      # explicit pilot required for phones
+    require_authorized_session: false  # enable only with a connected test host
+
+    # VLAN discovery uses numeric range ONLY. Confirm that all active access
+    # VLANs in this range are indeed in the organization's Data scope.
+    data_vlan_min: 500
+    data_vlan_max: 599
+
+    # Protect common infrastructure by description, in addition to validating
+    # switchport mode, shutdown, channel-group, and explicit exclusions.
+    protected_description_regex: '(uplink|trunk|firewall|router|core|distribution|do.not.touch)'
+
+    # Unrelated interface changes from Nabil's template are disabled by default.
+    overwrite_description: false
+    disable_link_logging: false
+    disable_snmp_link_traps: false
+    disable_auto_mdix: false
+
+    # Optional external export AFTER configuration validation, BEFORE save.
+    # Leave blank unless an authorized internal TFTP server is available.
+    tftp_server: ''
+
+    dot1x_lines:
+      - switchport mode access
+      - switchport nonegotiate
+      - authentication control-direction in
+      - authentication event fail action next-method
+      - authentication host-mode multi-auth
+      - authentication order dot1x mab
+      - authentication priority dot1x mab
+      - authentication port-control auto
+      - authentication periodic
+      - authentication timer reauthenticate server
+      - authentication timer inactivity 30
+      - mab
+      - dot1x pae authenticator
+      - dot1x timeout tx-period 8
+      - dot1x max-reauth-req 3
+      - dot1x max-start 5
+
+  tasks:
+    - name: Verify safe job options
+      ansible.builtin.assert:
+        that:
+          - run_mode in ['discover', 'deploy']
+          - deploy_scope in ['approved_only', 'all_discovered']
+          - data_vlan_min | int == 500
+          - data_vlan_max | int == 599
+          - max_ports_per_run | int >= 1
+        fail_msg: 'Invalid job options. Default discovery is read-only.'
+
+    - name: Retrieve configured VLAN inventory (read-only)
+      cisco.ios.ios_command:
+        commands:
+          - show vlan brief
+      register: vlan_table
+      changed_when: false
+
+    - name: Auto-discover ACTIVE 5xx VLAN IDs, without Vlan_Data
+      ansible.builtin.set_fact:
+        data_vlans: >-
+          {{ vlan_table.stdout[0]
+             | regex_findall('(?m)^\s*(5[0-9]{2})\s+\S+\s+active\b')
+             | unique | sort | list }}
+        vlan_port_map: {}
+        eligible_targets: []
+
+    - name: Refuse to guess if no active Data VLANs in 500-599 exist
+      ansible.builtin.assert:
+        that:
+          - data_vlans | length > 0
+        fail_msg: >-
+          No active VLAN in range 500-599 was found in 'show vlan brief'.
+          Nothing was changed. Check whether these switches use another naming
+          or numbering convention before modifying the discovery rules.
+
+    - name: List access members for each discovered VLAN (read-only)
+      cisco.ios.ios_command:
+        commands:
+          - 'show vlan id {{ item }}'
+      loop: '{{ data_vlans }}'
+      loop_control:
+        label: 'VLAN {{ item }}'
+      register: vlan_members
+      changed_when: false
+
+    - name: Parse member interfaces separately for each Data VLAN
+      ansible.builtin.set_fact:
+        vlan_port_map: >-
+          {{ vlan_port_map | combine({ (item.item | string):
+            (item.stdout[0].split('VLAN Type')[0]
+             | regex_findall('(?<![A-Za-z0-9])(?:GigabitEthernet|FiveGigabitEthernet|TenGigabitEthernet|TwoGigabitEthernet|TwentyFiveGigE|FortyGigabitEthernet|HundredGigE|Gi|Fi|Te|Twe|Tw|Fo|Hu)[0-9]+/[0-9]+/[0-9]+(?![A-Za-z0-9/])')
+             | unique | sort | list) }) }}
+      loop: '{{ vlan_members.results }}'
+      loop_control:
+        label: 'VLAN {{ item.item }}'
+
+    - name: Combine VLAN member interfaces (no blind interface range)
+      ansible.builtin.set_fact:
+        vlan_candidates: '{{ vlan_port_map.values() | list | flatten | unique | sort | list }}'
+
+    - name: Confirm switchport mode, VLAN, and running-config for candidates
+      cisco.ios.ios_command:
+        commands:
+          - 'show interfaces {{ item }} switchport'
+          - 'show running-config interface {{ item }}'
+      loop: '{{ vlan_candidates }}'
+      loop_control:
+        label: '{{ item }}'
+      register: inspected_ports
+      changed_when: false
+
+    - name: Select safe ACCESS ports on verified active 5xx Data VLANs
+      ansible.builtin.set_fact:
+        eligible_targets: >-
+          {{ eligible_targets + [
+               {'interface': item.item,
+                'vlan': (item.stdout[0]
+                  | regex_findall('(?im)^\s*Access Mode VLAN:\s*(5[0-9]{2})\b')
+                  | first),
+                'parent': ('interface ' ~ ((item.stdout[1]
+                  | regex_findall('(?im)^\s*interface\s+(\S+)')
+                  | first) | default(item.item))) }
+             ] }}
+      loop: '{{ inspected_ports.results }}'
+      loop_control:
+        label: '{{ item.item }}'
+      when:
+        - item.stdout | length == 2
+        - item.stdout[0] is search('(?im)^\s*Switchport:\s*Enabled\s*$')
+        - item.stdout[0] is search('(?im)^\s*Administrative Mode:\s*static access\s*$')
+        - >-
+          (item.stdout[0] | regex_findall('(?im)^\s*Access Mode VLAN:\s*(5[0-9]{2})\b')
+           | first | default('')) in data_vlans
+        - >-
+          item.item in (vlan_port_map[
+            (item.stdout[0] | regex_findall('(?im)^\s*Access Mode VLAN:\s*(5[0-9]{2})\b')
+             | first | default(''))] | default([]))
+        - item.stdout[1] is not search('(?im)^\s*shutdown\s*$')
+        - item.stdout[1] is not search('(?im)^\s*channel-group\s+\d+')
+        - item.stdout[1] is not search('(?im)^\s*service-policy type control subscriber\b')
+        - item.stdout[1] is not search('(?im)^\s*source template\s+')
+        - item.stdout[1] is not search('(?im)^\s*description\s+.*' ~ protected_description_regex)
+        - item.item not in excluded_interfaces
+        - >-
+          (allow_voice_vlan_ports | bool)
+          or (item.stdout[0] is search('(?im)^\s*Voice VLAN:\s*(?:none|0)(?:\s|$)'))
+
+    - name: Report automatic VLAN and eligible interface discovery
+      ansible.builtin.debug:
+        msg:
+          switch: '{{ inventory_hostname }}'
+          active_5xx_data_vlans: '{{ data_vlans }}'
+          vlan_memberships: '{{ vlan_port_map }}'
+          eligible_access_interfaces_and_vlans: '{{ eligible_targets }}'
+          excluded_interfaces: '{{ excluded_interfaces }}'
+          run_mode: '{{ run_mode }}'
+          warning: >-
+            Numeric VLAN membership alone cannot prove business Data classification.
+            Review the listed VLANs and ports with the network owner first.
+
+    - name: Prepare explicit deployment selection (no changes)
+      ansible.builtin.set_fact:
+        selected_targets: >-
+          {{ eligible_targets if deploy_scope == 'all_discovered'
+             else (eligible_targets | selectattr('interface', 'in', approved_interfaces) | list) }}
+      when: run_mode == 'deploy'
+
+    - name: Block deployments without explicit approval and port limits
+      ansible.builtin.assert:
+        that:
+          - deployment_approved | bool
+          - selected_targets | length > 0
+          - selected_targets | length <= max_ports_per_run | int
+          - >-
+            deploy_scope == 'all_discovered' or
+            (approved_interfaces | difference(eligible_targets | map(attribute='interface') | list) | length == 0)
+          - (selected_targets | map(attribute='interface') | unique | list | length) == (selected_targets | length)
+        fail_msg: >-
+          Deployment blocked. Set deployment_approved=true, use port names from
+          discovery for approved_interfaces, and enforce max_ports_per_run.
+          To deploy all eligible ports, explicitly set deploy_scope=all_discovered
+          AND choose an appropriate max_ports_per_run.
+      when: run_mode == 'deploy'
+
+    - name: Check global AAA/802.1X prerequisites before changing any port
+      cisco.ios.ios_command:
+        commands:
+          - 'show running-config | include ^aaa new-model|^aaa authentication dot1x|^dot1x system-auth-control'
+      register: aaa_output
+      changed_when: false
+      when: run_mode == 'deploy'
+
+    - name: Stop if global AAA/802.1X prerequisites are missing
+      ansible.builtin.assert:
+        that:
+          - aaa_output.stdout[0] is search('(?m)^aaa new-model\s*$')
+          - aaa_output.stdout[0] is search('(?m)^aaa authentication dot1x\s+\S+')
+          - aaa_output.stdout[0] is search('(?m)^dot1x system-auth-control\s*$')
+        fail_msg: >-
+          Missing global dot1x AAA prerequisites (or unexpected CLI format).
+          Nothing was changed. Confirm Cisco ISE/RADIUS availability and global
+          configuration before modifying client-facing interfaces.
+      when: run_mode == 'deploy'
+
+    - name: Prepare flash checkpoint filename (unique per run)
+      ansible.builtin.set_fact:
+        checkpoint_filename: >-
+          {{ 'ansible-dot1x-' ~
+             (inventory_hostname | regex_replace('[^A-Za-z0-9_-]', '_')) ~
+             '-' ~ now(utc=true, fmt='%Y%m%dT%H%M%SZ') ~ '.cfg' }}
+      when: run_mode == 'deploy'
+
+    - name: Show exact scope before change
+      ansible.builtin.debug:
+        msg:
+          switch: '{{ inventory_hostname }}'
+          changes: '{{ selected_targets }}'
+          commands_per_port: '{{ dot1x_lines }}'
+          checkpoint: 'flash:{{ checkpoint_filename }}'
+          startup_config_save: only_after_success
+      when: run_mode == 'deploy'
+
+    - name: Back up original running-config to Cisco flash BEFORE deployment
+      cisco.ios.ios_command:
+        commands:
+          - command: 'copy running-config flash:{{ checkpoint_filename }}'
+            prompt: 'Destination filename.*\?|\[confirm\]'
+            answer: "\r"
+      register: checkpoint_result
+      changed_when: true
+      when: run_mode == 'deploy'
+
+    - name: Verify flash checkpoint really exists
+      cisco.ios.ios_command:
+        commands:
+          - 'dir flash:{{ checkpoint_filename }}'
+      register: checkpoint_listing
+      changed_when: false
+      when: run_mode == 'deploy'
+
+    - name: Stop before configuration if backup is absent
+      ansible.builtin.assert:
+        that:
+          - checkpoint_filename in checkpoint_listing.stdout[0]
+          - checkpoint_listing.stdout[0] is not search('(?i)%Error|No such file|not found')
+        fail_msg: >-
+          Pre-change checkpoint could not be verified on the switch flash.
+          Nothing was changed. Check flash space and copy command output.
+      when: run_mode == 'deploy'
+
+    - name: Deploy, validate, export, and save; attempt SSH rollback on failure
+      when: run_mode == 'deploy'
+      block:
+        - name: Apply Nabil's 802.1X/MAB template to each verified port
+          cisco.ios.ios_config:
+            parents:
+              - '{{ item.parent }}'
+            lines: >-
+              {{
+                (['description Data'] if overwrite_description | bool else [])
+                + ['switchport access vlan ' ~ (item.vlan | string)]
+                + dot1x_lines
+                + (['no logging event link-status'] if disable_link_logging | bool else [])
+                + (['no snmp trap link-status'] if disable_snmp_link_traps | bool else [])
+                + (['no mdix auto'] if disable_auto_mdix | bool else [])
+              }}
+            match: line
+            save_when: never
+          loop: '{{ selected_targets }}'
+          loop_control:
+            label: '{{ item.interface }} (VLAN {{ item.vlan }})'
+          register: deployment_result
+
+        - name: Fetch post-deployment running configuration on affected ports
+          cisco.ios.ios_command:
+            commands:
+              - 'show running-config interface {{ item.interface }}'
+          loop: '{{ selected_targets }}'
+          loop_control:
+            label: '{{ item.interface }}'
+          register: post_configs
+          changed_when: false
+
+        - name: Verify ALL required lines and correct VLAN per interface
+          ansible.builtin.assert:
+            that:
+              - >-
+                ((['switchport access vlan ' ~ (item.item.vlan | string)]
+                  + dot1x_lines)
+                 | difference(item.stdout[0].splitlines() | map('trim') | list)
+                 | length) == 0
+            fail_msg: >-
+              802.1X template verification failed on {{ item.item.interface }}.
+              Rolling back the stack running-config from the flash checkpoint.
+          loop: '{{ post_configs.results }}'
+          loop_control:
+            label: '{{ item.item.interface }}'
+
+        - name: Optionally collect live authentication sessions for pilot
+          cisco.ios.ios_command:
+            commands:
+              - 'show access-session interface {{ item.interface }} details'
+          loop: '{{ selected_targets }}'
+          loop_control:
+            label: '{{ item.interface }}'
+          register: authentication_sessions
+          changed_when: false
+          when: require_authorized_session | bool
+
+        - name: Fail and roll back when a required pilot session is unauthorized
+          ansible.builtin.assert:
+            that:
+              - item.stdout[0] is search('(?im)^\s*Status:\s*Authorized\b')
+            fail_msg: 'No authorized client verified on {{ item.item.interface }}.'
+          loop: '{{ authentication_sessions.results | default([]) }}'
+          loop_control:
+            label: '{{ item.item.interface }}'
+          when: require_authorized_session | bool
+
+        - name: Optionally export verified running-config to authorized TFTP server
+          cisco.ios.ios_command:
+            commands:
+              - command: 'copy running-config tftp://{{ tftp_server }}/{{ inventory_hostname }}-dot1x-{{ checkpoint_filename }}'
+                prompt: 'Destination filename.*\?|\[confirm\]'
+                answer: "\r"
+          register: tftp_result
+          changed_when: true
+          when: tftp_server | length > 0
+
+        - name: Require successful optional TFTP export
+          ansible.builtin.assert:
+            that:
+              - tftp_result.stdout[0] is search('(?i)bytes copied|\[OK\]')
+            fail_msg: 'TFTP transfer was not confirmed; rolling back.'
+          when: tftp_server | length > 0
+
+        - name: Save running-config to startup-config ONLY after all checks pass
+          cisco.ios.ios_config:
+            save_when: modified
+
+      rescue:
+        - name: Attempt running-config restore from flash (SSH required)
+          cisco.ios.ios_command:
+            commands:
+              - 'configure replace flash:{{ checkpoint_filename }} force'
+          register: rollback_attempt
+          ignore_errors: true
+
+        - name: Assess reported rollback result
+          ansible.builtin.debug:
+            msg:
+              checkpoint: 'flash:{{ checkpoint_filename }}'
+              output: '{{ rollback_attempt.stdout | default([]) }}'
+              cisco_reported_rollback_complete: >-
+                {{ (rollback_attempt.stdout | default([]) | join('\n'))
+                   is search('(?i)Rollback Done') }}
+              warning: >-
+                Even 'Rollback Done' needs operational verification. If SSH was
+                lost or configure-replace failed, out-of-band recovery may be required.
+
+        - name: Mark the deployment as failed, never as successful after rescue
+          ansible.builtin.fail:
+            msg: >-
+              Deployment or validation failed on {{ inventory_hostname }}.
+              Attempted flash rollback: {{ checkpoint_filename }}. Inspect
+              configuration, actual access-session state, and client reachability
+              before any retry. Startup-config was not saved by this playbook.
+
+    - name: Final read-only or successful-deployment report
+      ansible.builtin.debug:
+        msg:
+          switch: '{{ inventory_hostname }}'
+          mode: '{{ run_mode }}'
+          discovered_data_vlans: '{{ data_vlans }}'
+          eligible_targets: '{{ eligible_targets }}'
+          changed_interfaces: "{{ selected_targets | default([]) if run_mode == 'deploy' else [] }}"
+          save_requested: "{{ run_mode == 'deploy' }}"
+          note: >-
+            Configuration-line verification is not proof of actual endpoint
+            authentication unless require_authorized_session was enabled.
